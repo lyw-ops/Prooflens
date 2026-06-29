@@ -37,8 +37,125 @@ end Demo
         self.assertEqual(final.docstring, None)
         base = analysis.declaration_map["Demo.base"]
         self.assertEqual(base.docstring, "Base helper.")
+        self.assertEqual([step.text for step in final.proof_steps], ["exact base n"])
+        self.assertEqual(final.proof_steps[0].tactic, "exact")
+        self.assertEqual(final.proof_steps[0].line, 8)
+
+    def test_ignores_declarations_and_dependencies_inside_comments(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Main.lean").write_text(
+                """
+namespace Demo
+
+lemma base (n : Nat) : n = n := by
+  rfl
+
+/-
+theorem ghost (n : Nat) : n = n := by
+  exact base n
+-/
+
+theorem final (n : Nat) : n = n := by
+  -- base appears here only as comment text.
+  /- Demo.base appears here only as block comment text. -/
+  rfl
+
+end Demo
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            analysis = scan_project(root)
+
+        names = {declaration.name for declaration in analysis.declarations}
+        self.assertNotIn("Demo.ghost", names)
+        self.assertEqual(analysis.declaration_map["Demo.final"].dependencies, [])
+
+    def test_clears_module_docstring_before_namespace(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Main.lean").write_text(
+                """
+/-- Module-level overview, not a declaration docstring. -/
+namespace Demo
+
+@[simp]
+lemma base (n : Nat) : n = n := by
+  rfl
+
+end Demo
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            analysis = scan_project(root)
+
+        base = analysis.declaration_map["Demo.base"]
+        self.assertEqual(base.docstring, None)
+        self.assertEqual(base.attributes, ["simp"])
+
+    def test_extracts_multiline_statement_without_body(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Main.lean").write_text(
+                """
+namespace Demo
+
+theorem multiline
+    (n : Nat)
+    (h : n = n) :
+    n = n := by
+  exact h
+
+end Demo
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            analysis = scan_project(root)
+
+        statement = analysis.declaration_map["Demo.multiline"].statement
+        self.assertIn("(h : n = n) :", statement)
+        self.assertTrue(statement.endswith("n = n"))
+        self.assertNotIn("exact h", statement)
+        declaration = analysis.declaration_map["Demo.multiline"]
+        self.assertEqual(declaration.formal_conclusion, "n = n")
+        self.assertEqual(
+            [(parameter.names, parameter.role) for parameter in declaration.formal_parameters],
+            [(["n"], "parameter"), (["h"], "assumption")],
+        )
+        steps = declaration.proof_steps
+        self.assertEqual([step.text for step in steps], ["exact h"])
+
+    def test_extracts_multiple_tactic_steps_with_bullets(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Main.lean").write_text(
+                """
+namespace Demo
+
+theorem both_true : True ∧ True := by
+  constructor
+  · trivial
+  · exact True.intro
+
+end Demo
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            analysis = scan_project(root)
+
+        steps = analysis.declaration_map["Demo.both_true"].proof_steps
+        self.assertEqual([step.tactic for step in steps], ["constructor", "trivial", "exact"])
+        self.assertEqual([step.text for step in steps], ["constructor", "trivial", "exact True.intro"])
+        self.assertEqual([step.line for step in steps], [4, 5, 6])
 
 
 if __name__ == "__main__":
     unittest.main()
-

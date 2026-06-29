@@ -21,19 +21,7 @@ def explain_symbol(
 
 
 def resolve_symbol(analysis: ProjectAnalysis, symbol: str) -> LeanDeclaration | None:
-    declaration_map = analysis.declaration_map
-    if symbol in declaration_map:
-        return declaration_map[symbol]
-    matches = [
-        declaration
-        for declaration in analysis.declarations
-        if declaration.name.endswith("." + symbol) or declaration.short_name == symbol
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if matches:
-        return sorted(matches, key=lambda item: (item.file, item.line))[0]
-    return None
+    return analysis.declaration_index().resolve_first(symbol)
 
 
 def _downstream_users(analysis: ProjectAnalysis, name: str) -> list[LeanDeclaration]:
@@ -159,4 +147,3 @@ def _role_sentence_zh(declaration: LeanDeclaration, downstream: list[LeanDeclara
     if declaration.kind in {"def", "structure", "class", "inductive"}:
         return "论文写作中，可以把它描述为 formalization 的基础对象；benchmark 构建时，它也适合作为依赖上下文而不是单独证明目标。"
     return "它适合作为 artifact 文档中的辅助声明，帮助读者定位 Lean 实现与数学叙述之间的对应关系。"
-

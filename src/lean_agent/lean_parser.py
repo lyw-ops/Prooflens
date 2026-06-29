@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from lean_agent.models import LeanDeclaration, LeanFileAnalysis
+from lean_agent.formal_type import decompose_formal_type
+from lean_agent.models import LeanDeclaration, LeanFileAnalysis, ProofStep
 
 
 DECLARATION_KINDS = (
@@ -90,14 +91,27 @@ def _find_declarations(
     pending_attributes: list[str] = []
     namespace_stack: list[str] = []
     scope_stack: list[tuple[str, str | None]] = []
+    block_comment_depth = 0
     line_index = 0
 
     while line_index < len(lines):
         line = lines[line_index]
         stripped = line.strip()
 
+        if block_comment_depth:
+            block_comment_depth = _block_comment_depth_after_line(line, block_comment_depth)
+            line_index += 1
+            continue
+
         if stripped.startswith("/--"):
             pending_docstring, line_index = _collect_docstring(lines, line_index)
+            continue
+
+        if stripped.startswith("/-"):
+            block_comment_depth = _block_comment_depth_after_line(line, 0)
+            pending_docstring = None
+            pending_attributes = []
+            line_index += 1
             continue
 
         attribute_match = ATTRIBUTE_RE.match(line)
@@ -111,18 +125,23 @@ def _find_declarations(
             name = namespace_match.group(1)
             namespace_stack.append(name)
             scope_stack.append(("namespace", name))
-            _clear_pending_if_needed(stripped, pending_attributes)
+            pending_docstring = None
+            pending_attributes = []
             line_index += 1
             continue
 
         if SECTION_RE.match(line):
             scope_stack.append(("section", None))
+            pending_docstring = None
+            pending_attributes = []
             line_index += 1
             continue
 
         end_match = END_RE.match(line)
         if end_match:
             _pop_scope(scope_stack, namespace_stack, end_match.group(1))
+            pending_docstring = None
+            pending_attributes = []
             line_index += 1
             continue
 
@@ -161,11 +180,6 @@ def _find_declarations(
     return declarations
 
 
-def _clear_pending_if_needed(stripped: str, pending_attributes: list[str]) -> None:
-    if stripped and not stripped.startswith("--"):
-        pending_attributes.clear()
-
-
 def _collect_docstring(lines: list[str], start: int) -> tuple[str, int]:
     collected: list[str] = []
     line_index = start
@@ -183,6 +197,22 @@ def _collect_docstring(lines: list[str], start: int) -> tuple[str, int]:
 
 def _clean_doc_line(line: str) -> str:
     return re.sub(r"^\s*\*\s?", "", line).rstrip()
+
+
+def _block_comment_depth_after_line(line: str, depth: int) -> int:
+    index = 0
+    while index < len(line) - 1:
+        marker = line[index : index + 2]
+        if marker == "/-":
+            depth += 1
+            index += 2
+            continue
+        if marker == "-/" and depth:
+            depth -= 1
+            index += 2
+            continue
+        index += 1
+    return depth
 
 
 def _pop_scope(
@@ -237,6 +267,10 @@ def _attach_source_and_statements(
         declaration.end_line = end + 1
         declaration.source = "\n".join(source_lines).rstrip()
         declaration.statement = extract_statement(declaration.source)
+        formal_type = decompose_formal_type(declaration.statement)
+        declaration.formal_parameters = formal_type.parameters
+        declaration.formal_conclusion = formal_type.conclusion
+        declaration.proof_steps = extract_proof_steps(declaration.source, declaration.line, declaration.kind)
 
 
 def extract_statement(source: str) -> str:
@@ -261,6 +295,88 @@ def extract_statement(source: str) -> str:
         if _statement_seems_complete(statement_lines):
             break
     return "\n".join(statement_lines).strip()
+
+
+PROOF_KINDS = {"theorem", "lemma", "example"}
+
+
+def extract_proof_steps(
+    source: str,
+    start_line: int = 1,
+    kind: str | None = None,
+) -> list[ProofStep]:
+    if kind is not None and kind not in PROOF_KINDS:
+        return []
+    lines = source.splitlines()
+    proof_start = _proof_start_index(lines)
+    if proof_start is None:
+        return []
+    steps: list[ProofStep] = []
+    for relative_index in range(proof_start, len(lines)):
+        raw_line = lines[relative_index]
+        line_without_comment = _remove_line_comment(raw_line)
+        if _is_proof_terminator(line_without_comment):
+            break
+        step_text = _normalize_tactic_line(line_without_comment)
+        if not step_text:
+            continue
+        if step_text in {"by", "where"}:
+            continue
+        if step_text.startswith(("case ", "| ")):
+            continue
+        tactic = _tactic_head(step_text)
+        if not tactic:
+            continue
+        steps.append(
+            ProofStep(
+                index=len(steps) + 1,
+                tactic=tactic,
+                text=step_text,
+                line=start_line + relative_index,
+                column=_first_nonspace_column(raw_line),
+                end_line=start_line + relative_index,
+            )
+        )
+    return steps
+
+
+def _proof_start_index(lines: list[str]) -> int | None:
+    for index, line in enumerate(lines):
+        stripped = _remove_line_comment(line).strip()
+        if ":= by" in stripped or stripped == "by" or stripped.startswith("by "):
+            return index
+    return None
+
+
+def _normalize_tactic_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    if ":= by" in stripped:
+        after_by = stripped.split(":= by", 1)[1].strip()
+        return after_by
+    if stripped.startswith("by "):
+        return stripped[3:].strip()
+    while stripped.startswith(("·", "*", "-")):
+        stripped = stripped[1:].strip()
+    return stripped
+
+
+def _is_proof_terminator(line: str) -> bool:
+    stripped = line.strip()
+    return bool(END_RE.match(stripped) or NAMESPACE_RE.match(stripped) or SECTION_RE.match(stripped))
+
+
+def _tactic_head(step_text: str) -> str:
+    match = re.match(r"([A-Za-z_][A-Za-z0-9_'.]*)", step_text)
+    return match.group(1) if match else ""
+
+
+def _first_nonspace_column(line: str) -> int:
+    for index, char in enumerate(line):
+        if not char.isspace():
+            return index + 1
+    return 1
 
 
 def _statement_seems_complete(lines: list[str]) -> bool:
@@ -302,6 +418,64 @@ def _relative_path(path: Path, root: Path) -> str:
 
 
 def tokenize_lean_source(source: str) -> set[str]:
-    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_'.]*", source))
+    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_'.]*", _strip_comments_and_strings(source)))
     return {token for token in tokens if token not in KEYWORDS}
 
+
+def _strip_comments_and_strings(source: str) -> str:
+    cleaned: list[str] = []
+    index = 0
+    block_depth = 0
+    in_string = False
+    escaped = False
+
+    while index < len(source):
+        char = source[index]
+        marker = source[index : index + 2]
+
+        if block_depth:
+            if marker == "/-":
+                block_depth += 1
+                cleaned.append("  ")
+                index += 2
+                continue
+            if marker == "-/":
+                block_depth -= 1
+                cleaned.append("  ")
+                index += 2
+                continue
+            cleaned.append("\n" if char == "\n" else " ")
+            index += 1
+            continue
+
+        if in_string:
+            cleaned.append("\n" if char == "\n" else " ")
+            if char == '"' and not escaped:
+                in_string = False
+            escaped = char == "\\" and not escaped
+            if char != "\\":
+                escaped = False
+            index += 1
+            continue
+
+        if marker == "--":
+            while index < len(source) and source[index] != "\n":
+                cleaned.append(" ")
+                index += 1
+            continue
+        if marker == "/-":
+            block_depth = 1
+            cleaned.append("  ")
+            index += 2
+            continue
+        if char == '"':
+            in_string = True
+            escaped = False
+            cleaned.append(" ")
+            index += 1
+            continue
+
+        cleaned.append(char)
+        index += 1
+
+    return "".join(cleaned)

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from lean_agent.declaration_index import DeclarationIndex
 from lean_agent.lean_parser import parse_lean_file, tokenize_lean_source
 from lean_agent.models import LeanDeclaration, LeanFileAnalysis, ProjectAnalysis
+from lean_agent.semantic_extractor import attach_semantics, extract_semantics
 
 
 IGNORED_DIRS = {
@@ -15,21 +17,47 @@ IGNORED_DIRS = {
     "dist",
     "__pycache__",
 }
+IGNORED_LEAN_FILES = {
+    "lakefile.lean",
+}
 
 
 def find_lean_files(root: str | Path) -> list[Path]:
     root_path = Path(root)
+    if not root_path.exists():
+        raise FileNotFoundError(f"Lean path does not exist: {root_path}")
     if root_path.is_file():
-        return [root_path] if root_path.suffix == ".lean" else []
+        if root_path.suffix != ".lean":
+            raise ValueError(f"Expected a .lean file or directory, got: {root_path}")
+        return [root_path]
+    if not root_path.is_dir():
+        raise NotADirectoryError(f"Lean path is not a directory: {root_path}")
     files: list[Path] = []
     for path in root_path.rglob("*.lean"):
-        if any(part in IGNORED_DIRS for part in path.parts):
+        if path.name in IGNORED_LEAN_FILES:
+            continue
+        if _is_ignored_path(path, root_path):
             continue
         files.append(path)
+    if not files:
+        raise FileNotFoundError(f"No .lean files found under: {root_path}")
     return sorted(files)
 
 
-def scan_project(root: str | Path) -> ProjectAnalysis:
+def _is_ignored_path(path: Path, root: Path) -> bool:
+    try:
+        relative_parts = path.relative_to(root).parts
+    except ValueError:
+        relative_parts = path.parts
+    return any(part in IGNORED_DIRS for part in relative_parts)
+
+
+def scan_project(
+    root: str | Path,
+    semantic: bool = False,
+    semantic_build: bool = False,
+    semantic_timeout: int = 120,
+) -> ProjectAnalysis:
     root_path = Path(root).resolve()
     scan_root = root_path.parent if root_path.is_file() else root_path
     lean_files = find_lean_files(root_path)
@@ -43,25 +71,30 @@ def scan_project(root: str | Path) -> ProjectAnalysis:
         for declaration in file_analysis.declarations
     ]
     _attach_dependencies(declarations)
-    return ProjectAnalysis(
+    analysis = ProjectAnalysis(
         root=str(scan_root),
         files=file_analyses,
         declarations=declarations,
     )
+    if semantic:
+        analysis.semantic = extract_semantics(
+            scan_root,
+            file_analyses,
+            declarations,
+            run_build=semantic_build,
+            timeout=semantic_timeout,
+        )
+        attach_semantics(declarations, analysis.semantic)
+    return analysis
 
 
 def _attach_dependencies(declarations: list[LeanDeclaration]) -> None:
-    token_to_names: dict[str, set[str]] = {}
-    for declaration in declarations:
-        token_to_names.setdefault(declaration.name, set()).add(declaration.name)
-        token_to_names.setdefault(declaration.short_name, set()).add(declaration.name)
-        token_to_names.setdefault(declaration.name.split(".")[-1], set()).add(declaration.name)
-
+    index = DeclarationIndex(declarations)
     for declaration in declarations:
         tokens = tokenize_lean_source(declaration.source)
         dependencies: set[str] = set()
         for token in tokens:
-            for candidate in token_to_names.get(token, set()):
+            for candidate in index.names_for_token(token):
                 if candidate != declaration.name:
                     dependencies.add(candidate)
         declaration.dependencies = sorted(dependencies)
@@ -74,6 +107,9 @@ def project_to_markdown(analysis: ProjectAnalysis) -> str:
     lines.append(f"- Root: `{analysis.root}`")
     lines.append(f"- Lean files: {len(analysis.files)}")
     lines.append(f"- Declarations: {len(analysis.declarations)}")
+    if analysis.semantic:
+        lines.append(f"- Semantic extraction: {analysis.semantic.status}")
+        lines.append(f"- Semantic declarations: {len(analysis.semantic.declarations)}")
     lines.append("")
 
     if analysis.files:
@@ -90,9 +126,10 @@ def project_to_markdown(analysis: ProjectAnalysis) -> str:
             else:
                 lines.append("- Declarations:")
                 for declaration in file_analysis.declarations:
-                    dep_count = len(declaration.dependencies)
+                    dep_count = len(analysis.direct_dependencies(declaration))
+                    semantic = f", semantic {declaration.semantic_kind}" if declaration.semantic_kind else ""
                     lines.append(
-                        f"  - `{declaration.name}` ({declaration.kind}, line {declaration.line}, deps {dep_count})"
+                        f"  - `{declaration.name}` ({declaration.kind}, line {declaration.line}, deps {dep_count}{semantic})"
                     )
             lines.append("")
 
@@ -101,7 +138,7 @@ def project_to_markdown(analysis: ProjectAnalysis) -> str:
         lines.append("## Proof Pipeline Candidates")
         lines.append("")
         for declaration in important:
-            deps = ", ".join(f"`{name}`" for name in declaration.dependencies) or "none"
+            deps = ", ".join(f"`{name}`" for name in analysis.direct_dependencies(declaration)) or "none"
             lines.append(f"- `{declaration.name}` ({declaration.kind}): depends on {deps}")
         lines.append("")
 
